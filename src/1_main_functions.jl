@@ -33,6 +33,9 @@ end
 Get the variance of an ItoIntegral from one point of time to another.
 """
 function get_variance(ito::ItoIntegral, from::Float64, to::Float64)
+    if from + eps() > to
+        return 0.0;
+    end
     return integral(ito.f_^2, from, to)
 end
 function get_variance(ito::ItoIntegral, base::Date, from::Date, to::Date)
@@ -55,6 +58,9 @@ end
 Get the covariance of two ItoIntegrals over a certain period given the underlying Brownian processes have a correlation of gaussian_correlation.
 """
 function get_covariance(ito1::ItoIntegral,ito2::ItoIntegral, from::Float64, to::Float64, gaussian_correlation::Float64)
+    if from + eps() >= to
+        return 0.0;
+    end
     return gaussian_correlation * integral(ito1.f_ * ito2.f_, from, to)
 end
 function get_covariance(ito1::ItoIntegral,ito2::ItoIntegral, base::Date, from::Date, to::Date, gaussian_correlation::Float64)
@@ -207,10 +213,12 @@ struct CovarianceAtDate
         if calculate_determinant determinant_       = det(covariance_) end
         return new(ito_set_, from_, to_, covariance_, covariance_labels_, chol_, inverse_, determinant_)
     end
-    function CovarianceAtDate(ito_set_::ItoSet, from::Date, to::Date)
+    function CovarianceAtDate(ito_set_::ItoSet, from::Date, to::Date;
+             calculate_chol::Bool = true, calculate_inverse::Bool = true, calculate_determinant::Bool = true)
         from_ = years_from_global_base(from)
         to_   = years_from_global_base(to)
-        return CovarianceAtDate(ito_set_, from_, to_)
+        return CovarianceAtDate(ito_set_, from_, to_; calculate_chol = calculate_chol,
+                  calculate_inverse = calculate_inverse, calculate_determinant = calculate_determinant)
     end
     function CovarianceAtDate(old_CovarianceAtDate::CovarianceAtDate, from::Float64, to::Float64)
         return CovarianceAtDate(old_CovarianceAtDate.ito_set_, from, to)
@@ -278,45 +286,41 @@ end
 
 ## Random draws
 """
-    get_normal_draws(covar::CovarianceAtDate; uniform_draw::Array{Float64} = rand(length(covar.covariance_labels_)))
-    get_normal_draws(covar::CovarianceAtDate, num::Int; twister::MersenneTwister = MersenneTwister(1234))
+    get_draws(covar::CovarianceAtDate; uniform_draw::Array{Float64} = rand(length(covar.covariance_labels_)))
+    get_draws(covar::CovarianceAtDate, num::Int; twister::MersenneTwister = MersenneTwister(1234), antithetic_variates = false)
 get pseudorandom draws from a CovarianceAtDate struct. Other schemes (like quasirandom) can be done by inserting quasirandom
 numbers in as the uniform_draw.
+If the antithetic_variates control is set to true then every second set of draws will be antithetic to the previous.
 """
-function get_normal_draws(covar::CovarianceAtDate; uniform_draw::Array{Float64} = rand(length(covar.covariance_labels_)))
+function get_draws(covar::CovarianceAtDate; uniform_draw::Array{Float64} = rand(length(covar.covariance_labels_)))
     number_of_itos = length(covar.covariance_labels_)
     normal_draw = quantile.(Ref(Normal()), uniform_draw)
     scaled_draw = covar.chol_ * normal_draw
-    return Dict{Symbol,Float64}(covar.covariance_labels_ .=> scaled_draw)
+    first_set_of_draws = Dict{Symbol,Float64}(covar.covariance_labels_ .=> scaled_draw)
+    return first_set_of_draws
 end
-function get_normal_draws(covar::CovarianceAtDate, num::Int; twister::MersenneTwister = MersenneTwister(1234))
-    array_of_dicts = Array{Dict{Symbol,Float64}}(undef, num)
-    number_of_itos = length(covar.covariance_labels_)
-    for i in 1:num
-        mersenne_draw = rand(twister,number_of_itos)
-        array_of_dicts[i] = get_normal_draws(covar; uniform_draw = mersenne_draw)
+function get_draws(covar::CovarianceAtDate, num::Int; number_generator::NumberGenerator = Mersenne(MersenneTwister(1234), length(covar.covariance_labels_)), antithetic_variates = false)
+    if antithetic_variates
+        half_num = convert(Int, round(num/2))
+        array_of_dicts = Array{Dict{Symbol,Float64}}(undef, half_num*2)
+        number_of_itos = length(covar.covariance_labels_)
+        for i in 1:half_num
+            first_entry = 2*(i-1)+1
+            draw = next!(number_generator)
+            array_of_dicts[first_entry] = get_draws(covar; uniform_draw = draw)
+            array_of_dicts[first_entry + 1] = get_draws(covar; uniform_draw = 1.0 .- draw)
+        end
+        return array_of_dicts
+    else
+        array_of_dicts = Array{Dict{Symbol,Float64}}(undef, num)
+        number_of_itos = length(covar.covariance_labels_)
+        for i in 1:num
+            draw =  next!(number_generator)
+            array_of_dicts[i] = get_draws(covar; uniform_draw = draw)
+        end
+        return array_of_dicts
     end
-    return array_of_dicts
 end
-
-"""
-    get_sobol_normal_draws(covar::CovarianceAtDate, sob_seq::SobolSeq)
-    get_sobol_normal_draws(covar::CovarianceAtDate, num::Int; sob_seq::SobolSeq = SobolSeq(length(covar.ItoSet_.ItoIntegrals_)))
-get sobol draws from a CovarianceAtDate struct.
-"""
-function get_sobol_normal_draws(covar::CovarianceAtDate, sob_seq::SobolSeq)
-    sobol_draw = next!(sob_seq)
-    return get_normal_draws(covar; uniform_draw = sobol_draw)
-end
-function get_sobol_normal_draws(covar::CovarianceAtDate, num::Int; sob_seq::SobolSeq = SobolSeq(length(covar.ito_set_.ito_integrals_)))
-    array_of_dicts = Array{Dict{Symbol,Float64}}(undef, num)
-    for i in 1:num
-        array_of_dicts[i] = get_sobol_normal_draws(covar,sob_seq)
-    end
-    return array_of_dicts
-end
-
-
 
 # This is most likely useful for bug hunting.
 """
